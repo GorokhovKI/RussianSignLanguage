@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import mediapipe as mp
 
+##Скелет демки
 
 # Загрузка модели
 checkpoint = torch.load('slovo_model.pth')
