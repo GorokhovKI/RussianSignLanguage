@@ -199,47 +199,198 @@ def process_videos_parallel(videos_root: Path, annotations_csv: Path, out_dir: P
     pd.DataFrame(idx_rows).to_csv(out_dir / 'index.csv', index=False)
     return results
 
+def _point_to_xyz(pt):
+    """Convert point representation to (x,y,z) floats. Accept dict or list-like."""
+    if pt is None:
+        return (0.0, 0.0, 0.0)
+    if isinstance(pt, dict):
+        # common keys: 'x','y','z'
+        # try both lower and upper-case and numeric indices
+        x = pt.get('x', pt.get('X'))
+        y = pt.get('y', pt.get('Y'))
+        z = pt.get('z', pt.get('Z', 0.0))
+        # sometimes mediapipe export wraps landmark as {'x':..., 'y':..., 'z':...}
+        try:
+            if x is None and isinstance(pt, dict) and 0 in pt:
+                x = pt.get(0)
+                y = pt.get(1)
+                z = pt.get(2, 0.0)
+        except Exception:
+            pass
+        try:
+            return (float(x), float(y), float(z))
+        except Exception:
+            # fallback: try converting values in insertion order
+            vals = list(pt.values())
+            if len(vals) >= 3:
+                try:
+                    return (float(vals[0]), float(vals[1]), float(vals[2]))
+                except Exception:
+                    return (0.0, 0.0, 0.0)
+            return (0.0, 0.0, 0.0)
+
+    if isinstance(pt, (list, tuple, np.ndarray)):
+        if len(pt) >= 3:
+            return (float(pt[0]), float(pt[1]), float(pt[2]))
+        if len(pt) == 2:
+            return (float(pt[0]), float(pt[1]), 0.0)
+    # unknown type
+    try:
+        f = float(pt)
+        return (f, 0.0, 0.0)
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+def _extract_landmarks_from_frame_repr(frame_repr, max_hands=2):
+    """
+    Преобразует представление кадра (frame_repr) в массив shape [max_hands, 21, 3].
+    Поддерживает:
+      - список рук: [ hand1, hand2, ... ], где hand = list_of_points или dict с 'landmark'
+      - dict с ключом 'multi_hand_landmarks' / 'hands' / 'landmark'
+      - hand элементы в виде dict {'landmark': [...] } или просто список точек
+      - точки в виде dict {'x':..., 'y':..., 'z':...} или list [x,y,z]
+    Возвращает numpy array dtype=float32.
+    """
+    H = max_hands
+    out = np.zeros((H, 21, 3), dtype=np.float32)
+    hands = []
+
+    # Если frame_repr — список, вероятно список рук или список точек
+    if isinstance(frame_repr, list):
+        # попытка понять: каждый элемент — рука или точка
+        # если элемент — dict с 'landmark', это рука
+        for elem in frame_repr:
+            if elem is None:
+                continue
+            if isinstance(elem, dict) and ('landmark' in elem or 'landmarks' in elem):
+                pts = elem.get('landmark') or elem.get('landmarks')
+                if isinstance(pts, list):
+                    hands.append([_point_to_xyz(p) for p in pts])
+            elif isinstance(elem, list) and (len(elem) == 21 or (len(elem) > 0 and isinstance(elem[0], (list, dict)))):
+                # elem — список точек рука
+                hands.append([_point_to_xyz(p) for p in elem])
+            else:
+                # возможно список кадров или другой формат; пропускаем
+                pass
+        # если не найдено рук, но сам frame_repr длины 21 -> трактуем как одна рука
+        if len(hands) == 0 and len(frame_repr) == 21:
+            hands.append([_point_to_xyz(p) for p in frame_repr])
+
+    # Если frame_repr — dict
+    elif isinstance(frame_repr, dict):
+        # сначала ищем явные ключи
+        for key in ('multi_hand_landmarks', 'hands', 'landmarks', 'hand_landmarks'):
+            if key in frame_repr:
+                candidate = frame_repr[key]
+                if isinstance(candidate, list):
+                    for hand in candidate:
+                        if isinstance(hand, dict) and ('landmark' in hand or 'landmarks' in hand):
+                            pts = hand.get('landmark') or hand.get('landmarks')
+                            if isinstance(pts, list):
+                                hands.append([_point_to_xyz(p) for p in pts])
+                        elif isinstance(hand, list):
+                            hands.append([_point_to_xyz(p) for p in hand])
+                    break
+        # если не нашли ключи, но словарь сам может быть hand (с 'landmark')
+        if len(hands) == 0 and 'landmark' in frame_repr:
+            pts = frame_repr.get('landmark')
+            if isinstance(pts, list):
+                hands.append([_point_to_xyz(p) for p in pts])
+        # fallback: пробуем найти any value that is list of length ~21
+        if len(hands) == 0:
+            for v in frame_repr.values():
+                if isinstance(v, list) and len(v) in (21,):
+                    hands.append([_point_to_xyz(p) for p in v])
+    else:
+        # неизвестный тип, вернём пустой (всё нули)
+        hands = []
+
+    # pad/truncate to H hands and ensure 21 points per hand
+    for i, hp in enumerate(hands[:H]):
+        pts = hp
+        if len(pts) < 21:
+            pts = pts + [(0.0, 0.0, 0.0)] * (21 - len(pts))
+        elif len(pts) > 21:
+            pts = pts[:21]
+        out[i, :, 0] = [p[0] for p in pts]
+        out[i, :, 1] = [p[1] for p in pts]
+        out[i, :, 2] = [p[2] for p in pts]
+    return out
+
 
 def convert_mediapipe_json_to_npz(json_path: Path, out_dir: Path, annotations_csv: Path | None = None, options: dict | None = None):
-    """Конвертирует slovo_mediapipe.json в .npz файлы с теми же нормализациями, что и при извлечении из видео.
-    json формат может быть вариативен — адаптируемся под несколько возможных структур.
+    """
+    Robust converter for slovo_mediapipe.json -> per-video .npz files.
+    Each video in JSON may have different representation; this function handles dict/list variants.
+    Saves index_conversion.csv with status per video.
     """
     with open(json_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+        raw = json.load(f)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     options = options or {}
     rows = []
-    for vid, frames in tqdm(data.items(), desc='Converting mediapipe json'):
+    total = len(raw)
+    # iterate through keys (video ids or filenames)
+    for vid, frames in tqdm(raw.items(), desc='Converting mediapipe json', total=total):
         try:
-            arr = np.array(frames, dtype=np.float32)
-            # возможные форматы: [T, H, 21, 3] или [T, list_of_hands] или [list_of_frames_as_flat]
-            if arr.ndim == 1:
-                # попытаемся распаковать
-                arr = np.stack([np.array(f, dtype=np.float32) for f in frames], axis=0)
-            # теперь ожидаем [T,...]
-            if arr.ndim == 4:
-                lm = arr
-            elif arr.ndim == 3:
-                # возможно [T, 21, 3] (одна рука) -> добавить размерность рук
-                lm = arr[:, None, :, :]
+            # frames can be:
+            # - list of frames (each frame list/dict)
+            # - dict containing key 'frames' or similar
+            if isinstance(frames, dict):
+                # try to find list-like child
+                candidate = None
+                for k in ('frames', 'data', 'landmarks', 'mp_frames', 'annotations'):
+                    if k in frames and isinstance(frames[k], list):
+                        candidate = frames[k]
+                        break
+                if candidate is not None:
+                    iter_frames = candidate
+                else:
+                    # fallback: try values
+                    iter_frames = list(frames.values())
             else:
-                # пытаться привести к [T, H, 21, 3]
-                lm = arr
+                iter_frames = frames
+
+            parsed_frames = []
+            for fr in iter_frames:
+                parsed = _extract_landmarks_from_frame_repr(fr, max_hands=options.get('max_hands', 2))
+                parsed_frames.append(parsed)
+
+            if len(parsed_frames) == 0:
+                arr = np.zeros((0, options.get('max_hands', 2), 21, 3), dtype=np.float32)
+            else:
+                arr = np.stack(parsed_frames, axis=0).astype(np.float32)  # [T,H,21,3]
+
+            # optional normalizations (root_relative, scale_normalize) if requested
             if options.get('root_relative', True):
-                lm = normalize_root_relative(lm)
+                # subtract wrist (index 0) x,y for each hand
+                if arr.shape[0] > 0:
+                    root = arr[:, :, 0:1, :2]  # [T,H,1,2]
+                    arr[:, :, :, :2] = arr[:, :, :, :2] - root
+
             if options.get('scale_normalize', True):
-                lm = normalize_scale_by_hand(lm, reference_pair=options.get('scale_reference', (0,9)))
+                # scale by distance between keypoints (0 and 9) if available
+                if arr.shape[0] > 0:
+                    a = arr[:, :, 0, :2]
+                    b = arr[:, :, 9, :2]
+                    d = np.linalg.norm(a - b, axis=-1)  # shape [T, H]
+                    d_safe = np.where(d <= 1e-6, 1.0, d)
+                    # expand dims to [T, H, 1, 1] so division broadcasts correctly against (T,H,21,2)
+                    d_safe = d_safe[:, :, None, None]
+                    arr[:, :, :, :2] = arr[:, :, :, :2] / d_safe
+
             if options.get('fixed_length', None):
-                lm = pad_or_truncate(lm, options['fixed_length'], pad_mode=options.get('pad_mode','edge'))
+                arr = pad_or_truncate(arr, options['fixed_length'], pad_mode=options.get('pad_mode','edge'))
+
             out_path = out_dir / f"{Path(vid).stem}.npz"
-            metadata = {'label': None, 'video_id': vid, 'fps': None, 'orig_num_frames': lm.shape[0]}
-            save_npz(out_path, lm, metadata)
+            meta = {'label': None, 'video_id': vid, 'fps': None, 'orig_num_frames': arr.shape[0]}
+            np.savez_compressed(out_path, landmarks=arr, **meta)
             rows.append({'video_id': vid, 'out_path': str(out_path), 'status': 'ok'})
         except Exception as e:
             rows.append({'video_id': vid, 'error': str(e), 'status': 'error'})
     pd.DataFrame(rows).to_csv(out_dir / 'index_conversion.csv', index=False)
     return rows
-
 
 if __name__ == '__main__':
     import argparse
