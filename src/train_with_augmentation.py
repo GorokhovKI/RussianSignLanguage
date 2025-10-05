@@ -25,21 +25,36 @@ class AugmentedSlovoDataset(Dataset):
         if include_augmented:
             npz_files += list((self.features_dir / 'augmented').glob('*.npz')) if (self.features_dir / 'augmented').exists() else []
         samples = []
+        skipped = 0
         for p in npz_files:
             try:
                 data = np.load(p, allow_pickle=True)
+                lm = data.get('landmarks', None)
+                if lm is None:
+                    # если нет landmarks — пропускаем файл
+                    skipped += 1
+                    continue
+                # если нулевая длина (T == 0), пропускаем на этапе инициализации
+                if lm.size == 0 or (lm.ndim >= 1 and lm.shape[0] == 0):
+                    skipped += 1
+                    continue
                 label = data.get('label', None)
                 if label is None:
                     # try to infer from filename
                     label = p.stem.split('_')[1] if '_' in p.stem else 'UNKNOWN'
                 samples.append((str(p), str(label)))
             except Exception:
+                # можно логгировать имя файла при желании
+                skipped += 1
                 continue
         self.samples = samples
+        if len(samples) == 0:
+            raise RuntimeError(f"No valid samples found in {features_dir} (skipped {skipped} files).")
         # infer classes
         labels = sorted(list({lab for _, lab in self.samples}))
         self.classes = labels
         self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+
 
     def __len__(self):
         return len(self.samples)
@@ -47,14 +62,55 @@ class AugmentedSlovoDataset(Dataset):
     def __getitem__(self, idx):
         p, label = self.samples[idx]
         d = np.load(p, allow_pickle=True)
-        lm = d['landmarks']
+        lm = d.get('landmarks', None)
+        if lm is None:
+            # нечего вернуть — безопасно пометить как пустой
+            # но так как в __init__ мы отфильтровали такие файлы, это редкость
+            if self.fixed_length is None:
+                raise ValueError(f"No landmarks in {p} and no fixed_length provided.")
+            # create zero landmarks fallback (assume 3D landmarks by default)
+            lm = np.zeros((self.fixed_length, 1, 1), dtype=np.float32)
+
+        # если всё же T == 0 (на всякий случай)
+        if lm.size == 0 or (lm.ndim >= 1 and lm.shape[0] == 0):
+            if self.fixed_length is None:
+                raise ValueError(f"Empty landmarks in {p} and no fixed_length specified.")
+            # попытаться восстановить форму по оставшимся осям
+            if lm.ndim == 3:
+                _, P, K = lm.shape
+                lm = np.zeros((self.fixed_length, P, K), dtype=np.float32)
+            elif lm.ndim == 4:
+                _, H, P, K = lm.shape
+                lm = np.zeros((self.fixed_length, H, P, K), dtype=np.float32)
+            else:
+                # универсальный fallback
+                lm = np.zeros((self.fixed_length, 1, 1), dtype=np.float32)
+
         # possibly apply augmentation
         if self.augment:
             lm = random_augment(lm, fixed_length=self.fixed_length)
+            # guard: augmentation должен вернуть хотя бы 1 кадр
+            if lm is None or lm.size == 0 or (lm.ndim >= 1 and lm.shape[0] == 0):
+                # заменим паддингом
+                if self.fixed_length is None:
+                    raise ValueError(f"Augmentation produced empty sequence for {p} and fixed_length is None.")
+                if lm is None or lm.ndim < 1:
+                    lm = np.zeros((self.fixed_length, 1, 1), dtype=np.float32)
+                else:
+                    # восстановим ожидаемую форму
+                    if lm.ndim == 3:
+                        _, P, K = lm.shape
+                        lm = np.zeros((self.fixed_length, P, K), dtype=np.float32)
+                    elif lm.ndim == 4:
+                        _, H, P, K = lm.shape
+                        lm = np.zeros((self.fixed_length, H, P, K), dtype=np.float32)
+                    else:
+                        lm = np.zeros((self.fixed_length, 1, 1), dtype=np.float32)
         else:
             if self.fixed_length is not None:
                 from extract_features import pad_or_truncate
                 lm = pad_or_truncate(lm, self.fixed_length, pad_mode='edge')
+
         # flatten per frame
         if lm.ndim == 4:
             T, H, P, K = lm.shape
@@ -63,16 +119,29 @@ class AugmentedSlovoDataset(Dataset):
             T, P, K = lm.shape
             feat = lm.reshape(T, P * K)
         else:
-            raise ValueError(f'Unexpected landmarks shape: {lm.shape}')
+            raise ValueError(f'Unexpected landmarks shape: {lm.shape} from file {p}')
         feat = feat.astype(np.float32)
         label_idx = self.class_to_idx[label]
         return feat, label_idx
 
 
 def collate_fn(batch):
-    feats = [torch.from_numpy(item[0]) for item in batch]
-    labels = torch.tensor([item[1] for item in batch], dtype=torch.long)
+    # фильтруем случайные пустые примеры, чтобы torch.stack не падал
+    feats = []
+    labels = []
+    for item in batch:
+        feat_np, lab = item
+        if feat_np is None:
+            continue
+        if feat_np.shape[0] == 0:
+            # пропустить (или можно заменить на нулевой тензор)
+            continue
+        feats.append(torch.from_numpy(feat_np))
+        labels.append(lab)
+    if len(feats) == 0:
+        raise RuntimeError("All batch samples have zero length (check dataset / augmentation).")
     X = torch.stack(feats, dim=0)
+    labels = torch.tensor(labels, dtype=torch.long)
     return X, labels
 
 
@@ -123,8 +192,8 @@ def train(args):
 
     # weighted sampler for train
     class_weights = compute_class_weights(dataset)
-    sample_weights = [class_weights[dataset.class_to_idx[lab]].item() for _, lab in dataset.samples]
-    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+    sample_weights = [class_weights[dataset.class_to_idx[dataset.samples[i][1]]].item() for i in train_idx]
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(train_idx), replacement=True)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
