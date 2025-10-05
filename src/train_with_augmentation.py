@@ -190,6 +190,21 @@ def train(args):
     train_dataset = torch.utils.data.Subset(dataset, train_idx)
     val_dataset = torch.utils.data.Subset(AugmentedSlovoDataset(Path(args.features_dir), Path(args.annotations), fixed_length=args.fixed_length, augment=False, include_augmented=args.use_augmented), val_idx)
 
+    train_files = {dataset.samples[i][0] for i in train_idx}
+    val_files = {dataset.samples[i][0] for i in val_idx}
+    print("Train size:", len(train_files))
+    print("Val size:", len(val_files))
+    print("Intersection size:", len(train_files & val_files))
+    if len(train_files & val_files) > 0:
+        print("Примеры пересекаются! Примеры:", list(train_files & val_files)[:10])
+
+    from collections import Counter
+    train_labels = [dataset.samples[i][1] for i in train_idx]
+    val_labels = [dataset.samples[i][1] for i in val_idx]
+    print("Train:", len(train_labels), " Val:", len(val_labels))
+    print("Train label counts (top 20):", Counter(train_labels).most_common(20))
+    print("Val label counts (top 20):", Counter(val_labels).most_common(20))
+
     # weighted sampler for train
     class_weights = compute_class_weights(dataset)
     sample_weights = [class_weights[dataset.class_to_idx[dataset.samples[i][1]]].item() for i in train_idx]
