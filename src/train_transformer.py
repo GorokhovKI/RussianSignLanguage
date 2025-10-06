@@ -3,24 +3,20 @@ import argparse
 from pathlib import Path
 import numpy as np
 import torch
-from sklearn.utils import compute_class_weight
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 from sklearn.model_selection import train_test_split
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
-from augmentations import random_augment
 from typing import List
-import random
 import os
 
 # TensorBoard logging
 from torch.utils.tensorboard import SummaryWriter
 
-# Пути и конфигурация (замените на свои, если используете config.py)
+# Пути и конфигурация
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-FIXED_LENGTH = 64  # можно передать как аргумент
 
 
 class AugmentedSlovoDataset(Dataset):
@@ -103,7 +99,8 @@ class AugmentedSlovoDataset(Dataset):
 
         # possibly apply augmentation
         if self.augment:
-            m = random_augment(lm, fixed_length=self.fixed_length)
+            # lm = random_augment(lm, fixed_length=self.fixed_length)
+            # ^ если у вас есть augmentations, раскомментируйте выше
             pass
             # guard: augmentation должен вернуть хотя бы 1 кадр
             if lm is None or lm.size == 0 or (lm.ndim >= 1 and lm.shape[0] == 0):
@@ -161,72 +158,58 @@ def collate_fn(batch):
     return X, labels
 
 
-class GestureModelSmall(nn.Module):
-    def __init__(self, input_dim: int, num_classes: int, hidden_size: int = 256):
+# Мощная Transformer-модель
+class TransformerGestureModel(nn.Module):
+    def __init__(self, input_dim: int, num_classes: int, nhead=8, num_layers=6, dropout=0.3):
         super().__init__()
-        self.input_dim = input_dim
-        self.hidden_size = hidden_size
-
-        # Conv1d для извлечения локальных паттернов
-        self.conv = nn.Sequential(
-            nn.Conv1d(input_dim, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
+        self.input_proj = nn.Linear(input_dim, 512)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=512,
+            nhead=nhead,
+            dropout=dropout,
+            batch_first=True,
+            dim_feedforward=2048
         )
-
-        # LSTM
-        self.lstm = nn.LSTM(input_size=256, hidden_size=hidden_size, num_layers=2,
-                            batch_first=True, bidirectional=True, dropout=0.3)
-
-        # Global Average Pooling по временной оси
-        self.gap = nn.AdaptiveAvgPool1d(1)
-
-        # Attention (опционально)
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size * 2, num_heads=8, batch_first=True)
-
-        # Final classifier
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, 512),
+            nn.Linear(512, 512),
             nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Dropout(dropout),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout),
             nn.Linear(256, num_classes)
         )
 
     def forward(self, x):
-        # x shape: [B, T, F]
-        x = x.permute(0, 2, 1)  # [B, F, T]
-        x = self.conv(x)        # [B, C, T]
-        x = x.permute(0, 2, 1)  # [B, T, C]
-
-        lstm_out, _ = self.lstm(x)  # [B, T, H*2]
-
-        # Attention
-        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)  # [B, T, H*2]
-        x = attn_out
-
-        # Global average pooling
-        x = x.permute(0, 2, 1)  # [B, H*2, T]
-        x = self.gap(x)         # [B, H*2, 1]
-        x = x.squeeze(-1)       # [B, H*2]
-
+        x = self.input_proj(x)
+        x = self.transformer(x)
+        x = x[:, -1, :]  # берем последний токен
         return self.fc(x)
 
 
 def train(args):
-    dataset = AugmentedSlovoDataset(Path(args.features_dir), Path(args.annotations), fixed_length=args.fixed_length, augment=True, include_augmented=args.use_augmented)
+    dataset = AugmentedSlovoDataset(
+        Path(args.features_dir),
+        Path(args.annotations),
+        fixed_length=args.fixed_length,
+        augment=True,
+        include_augmented=args.use_augmented
+    )
     labels = [lab for _, lab in dataset.samples]
     idxs = list(range(len(dataset)))
     train_idx, val_idx = train_test_split(idxs, test_size=0.15, random_state=14, stratify=labels, shuffle=True)
     train_dataset = torch.utils.data.Subset(dataset, train_idx)
-    val_dataset = torch.utils.data.Subset(AugmentedSlovoDataset(Path(args.features_dir), Path(args.annotations), fixed_length=args.fixed_length, augment=False, include_augmented=args.use_augmented), val_idx)
+    val_dataset = torch.utils.data.Subset(
+        AugmentedSlovoDataset(
+            Path(args.features_dir),
+            Path(args.annotations),
+            fixed_length=args.fixed_length,
+            augment=False,
+            include_augmented=args.use_augmented
+        ),
+        val_idx
+    )
 
     # DataLoader без WeightedRandomSampler
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
@@ -234,13 +217,17 @@ def train(args):
 
     sample_feat, _ = dataset[0]
     input_dim = sample_feat.shape[1]
-    model = GestureModelSmall(input_dim=input_dim, num_classes=len(dataset.classes))
+    model = TransformerGestureModel(
+        input_dim=input_dim,
+        num_classes=len(dataset.classes),
+        nhead=8,
+        num_layers=6,
+        dropout=0.3
+    )
     model.to(DEVICE)
 
-    class_weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
-    class_weights = torch.FloatTensor(class_weights).to(DEVICE)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     # LR Scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
@@ -332,21 +319,21 @@ def train(args):
                 break
 
     writer.close()
-    pd.DataFrame(history).to_csv(Path(args.metrics_dir)/'training_history_aug.csv', index=False)
+    pd.DataFrame(history).to_csv(Path(args.metrics_dir)/'training_history_transformer.csv', index=False)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--features_dir', type=str, default='results/features')
     parser.add_argument('--annotations', type=str, default='data/annotations.csv')
-    parser.add_argument('--models_dir', type=str, default='results/models')
-    parser.add_argument('--metrics_dir', type=str, default='results/metrics')
-    parser.add_argument('--tensorboard_dir', type=str, default='results/tensorboard')
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--epochs', type=int, default=100)  # увеличено
-    parser.add_argument('--patience', type=int, default=10)  # для early stopping
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--fixed_length', type=int, default=64)
+    parser.add_argument('--models_dir', type=str, default='results_transformer/models')
+    parser.add_argument('--metrics_dir', type=str, default='results_transformer/metrics')
+    parser.add_argument('--tensorboard_dir', type=str, default='results_transformer/tensorboard')
+    parser.add_argument('--batch_size', type=int, default=16)  # уменьшено, т.к. трансформер тяжёлый
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--patience', type=int, default=10)
+    parser.add_argument('--lr', type=float, default=1e-4)  # уменьшено
+    parser.add_argument('--fixed_length', type=int, default=128)  # увеличили
     parser.add_argument('--use_augmented', type=bool, default=True)
     args = parser.parse_args()
 
